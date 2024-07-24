@@ -1,7 +1,76 @@
 import streamlit as st
 from openai import OpenAI
-
+import json
 import re
+import os
+import PyPDF2
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize, sent_tokenize
+
+# Set page config at the very beginning
+st.set_page_config(page_title="Fraud Analysis Platform", layout="wide")
+
+# Download NLTK data
+nltk.download('punkt', quiet=True)
+nltk.download('stopwords', quiet=True)
+
+# Define functions
+def extract_text_from_pdf(pdf_path):
+    with open(pdf_path, 'rb') as file:
+        reader = PyPDF2.PdfReader(file)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text()
+    return text
+
+def summarize_text(text, num_lines=20):
+    sentences = sent_tokenize(text)
+
+    # If there are fewer sentences than requested lines, return all sentences
+    if len(sentences) <= num_lines:
+        return ' '.join(sentences)
+
+    # Calculate the step size to evenly distribute sentences
+    step = max(1, len(sentences) // num_lines)
+
+    # Select evenly distributed sentences
+    summary = ' '.join(sentences[::step][:num_lines])
+
+    return summary
+
+@st.cache_resource
+def process_knowledge_base():
+    knowledge_base = ""
+    knowledge_base_dir = 'knowledge_base'
+
+    if not os.path.exists(knowledge_base_dir):
+        print(f"Warning: '{knowledge_base_dir}' folder not found. Proceeding with empty knowledge base.")
+        return knowledge_base
+
+    pdf_files = [f for f in os.listdir(knowledge_base_dir) if f.endswith('.pdf')]
+
+    if not pdf_files:
+        print(f"Warning: No PDF files found in '{knowledge_base_dir}'. Proceeding with empty knowledge base.")
+        return knowledge_base
+
+    # Limit to 5 documents
+    for pdf_file in pdf_files[:5]:
+        pdf_path = os.path.join(knowledge_base_dir, pdf_file)
+        try:
+            text = extract_text_from_pdf(pdf_path)
+            summary = summarize_text(text, num_lines=20)
+            knowledge_base += f"Summary of {pdf_file}:\n{summary}\n\n"
+            print(f"Processed: {pdf_file}")
+        except Exception as e:
+            print(f"Error processing {pdf_file}: {str(e)}")
+
+    return knowledge_base
+
+
+
+# Process knowledge base once at startup
+KNOWLEDGE_BASE = process_knowledge_base()
 
 # Function to get LLM response
 def get_llm_response(api_key, goals, task=None):
@@ -26,6 +95,9 @@ Example Fraud Vectors and Key Challenges:
 - Crypto-Related Fraud: Scams and fraudulent activities involving cryptocurrencies and blockchain technology.
 - Real-Time Payment Fraud: Exploiting the speed of instant payment systems for fraudulent transactions.
 
+Additional Knowledge:
+{KNOWLEDGE_BASE}
+
 Your tasks should address these challenges using tools like image analysis, ML for anomaly detection, rule creation for standard fraud schemes, monitoring RDI ratios, and leveraging consortium data.
 Your tasks should also be tasks that an AI can run.
 
@@ -40,11 +112,17 @@ CHECKLIST:
         {"role": "system", "content": "You are a helpful assistant specialized in fraud analysis."},
         {"role": "user", "content": prompt}
     ]
-
+    print("\n--- RAW PROMPT ---")
+    print(json.dumps(messages, indent=2))
+    print("--- END RAW PROMPT ---\n")
     response = client.chat.completions.create(model="gpt-4o",
-    messages=messages)
-
+                                              messages=messages)
+    # Print raw response to terminal
+    print("\n--- RAW RESPONSE ---")
+    print(json.dumps(response.model_dump(), indent=2))
+    print("--- END RAW RESPONSE ---\n")
     return response.choices[0].message.content
+
 
 # Function to parse checklist items
 def parse_checklist(checklist_text):
@@ -55,7 +133,8 @@ def parse_checklist(checklist_text):
     for line in lines:
         line = line.strip()
         if line and not line.startswith(('CHECKLIST:', 'Checklist:')):
-            if re.match(r'^\d+\.', line) or (not line.startswith('-') and not line.startswith('•') and ':' in line):  # Main category
+            if re.match(r'^\d+\.', line) or (
+                    not line.startswith('-') and not line.startswith('•') and ':' in line):  # Main category
                 current_category = re.sub(r'^\d+\.\s*', '', line)
                 current_subcategory = None
                 parsed_items.append({"text": current_category, "is_category": True, "level": 1})
@@ -75,8 +154,6 @@ def parse_checklist(checklist_text):
                     })
     return parsed_items
 
-# Streamlit app
-st.set_page_config(page_title="Fraud Analysis Platform", layout="wide")
 
 # Initialize session state
 if 'checklist_items' not in st.session_state:
@@ -99,6 +176,13 @@ default_goals = """I have a suspicious counterfeit check that I want to analyze,
 goals = st.sidebar.text_area("Enter Automation Goals", value=default_goals)
 
 uploaded_file = st.sidebar.file_uploader("Upload Image", type=["png", "jpg", "jpeg"])
+
+# Display knowledge base status
+st.sidebar.subheader("Knowledge Base Status")
+if KNOWLEDGE_BASE:
+    st.sidebar.success("Knowledge base loaded successfully.")
+else:
+    st.sidebar.warning("No knowledge base found. Using default information only.")
 
 # Main content
 st.title("giniX Fraud Analysis Demo")
@@ -173,7 +257,9 @@ if st.session_state.checklist_items:
 
         if i in st.session_state.ai_responses:
             with st.expander(f"AI Response for: {item['text']}"):
-                st.markdown(f"<div style='background-color: #ffffd0; padding: 10px; border-radius: 5px;'>{st.session_state.ai_responses[i]}</div>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div style='background-color: #ffffd0; padding: 10px; border-radius: 5px;'>{st.session_state.ai_responses[i]}</div>",
+                    unsafe_allow_html=True)
 else:
     st.warning("No checklist items available. Try generating the analysis again.")
 
