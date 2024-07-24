@@ -1,12 +1,13 @@
 import streamlit as st
 from openai import OpenAI
-import json
 import re
 import os
 import PyPDF2
 import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize, sent_tokenize
+import pandas as pd
+import json
 
 # Set page config at the very beginning
 st.set_page_config(page_title="Fraud Analysis Platform", layout="wide")
@@ -15,7 +16,11 @@ st.set_page_config(page_title="Fraud Analysis Platform", layout="wide")
 nltk.download('punkt', quiet=True)
 nltk.download('stopwords', quiet=True)
 
-# Define functions
+def clear_analysis_results():
+    st.session_state.checklist_items = []
+    st.session_state.ai_responses = {}
+    if 'ai_findings' in st.session_state:
+        del st.session_state.ai_findings
 def extract_text_from_pdf(pdf_path):
     with open(pdf_path, 'rb') as file:
         reader = PyPDF2.PdfReader(file)
@@ -27,14 +32,10 @@ def extract_text_from_pdf(pdf_path):
 def summarize_text(text, num_lines=20):
     sentences = sent_tokenize(text)
 
-    # If there are fewer sentences than requested lines, return all sentences
     if len(sentences) <= num_lines:
         return ' '.join(sentences)
 
-    # Calculate the step size to evenly distribute sentences
     step = max(1, len(sentences) // num_lines)
-
-    # Select evenly distributed sentences
     summary = ' '.join(sentences[::step][:num_lines])
 
     return summary
@@ -54,7 +55,6 @@ def process_knowledge_base():
         print(f"Warning: No PDF files found in '{knowledge_base_dir}'. Proceeding with empty knowledge base.")
         return knowledge_base
 
-    # Limit to 5 documents
     for pdf_file in pdf_files[:5]:
         pdf_path = os.path.join(knowledge_base_dir, pdf_file)
         try:
@@ -67,17 +67,28 @@ def process_knowledge_base():
 
     return knowledge_base
 
+@st.cache_data
+def load_transaction_data():
+    transaction_data = {}
+    transaction_dir = 'transactions'
+    if os.path.exists(transaction_dir):
+        for file in os.listdir(transaction_dir):
+            if file.endswith('.csv'):
+                file_path = os.path.join(transaction_dir, file)
+                df = pd.read_csv(file_path)
+                transaction_data[file] = df
+    return transaction_data
 
-
-# Process knowledge base once at startup
+# Process knowledge base and load transaction data once at startup
 KNOWLEDGE_BASE = process_knowledge_base()
+TRANSACTION_DATA = load_transaction_data()
 
-# Function to get LLM response
-def get_llm_response(api_key, goals, task=None):
+def get_llm_response(api_key, goals, analysis_type, task=None, transaction_data=None):
     if task:
         prompt = f"Perform the following task related to fraud analysis: {task}\n\nProvide a response indicating if the task was completed, and any follow-up tasks if they exist."
     else:
-        prompt = f"""As a fraud analyst, break down the following automation goals into high-level findings and detailed, actionable checklist tasks. Refer to the provided example of fraud vectors and key challenges to guide your breakdown:
+        if analysis_type == "Image Analysis":
+            prompt = f"""As a fraud analyst, break down the following automation goals into high-level findings and detailed, actionable checklist tasks for analyzing a suspicious check image. Refer to the provided example of fraud vectors and key challenges to guide your breakdown:
 
 Automation Goals: {goals}
 
@@ -108,23 +119,53 @@ INSIGHTS:
 CHECKLIST:
 [List detailed, actionable checklist items here. Ensure all tasks are actionable and avoid empty items. Use bullet points for tasks.]
 """
+        else:
+            prompt = f"""As a fraud analyst, break down the following automation goals into high-level findings and detailed, actionable checklist tasks for analyzing transaction data. Refer to the provided example of fraud vectors and key challenges to guide your breakdown:
+
+Automation Goals: {goals}
+
+Transaction Data Summary:
+{transaction_data.describe().to_string() if transaction_data is not None else "No transaction data provided"}
+
+Example Fraud Vectors and Key Challenges:
+- Unusual Transaction Patterns: Sudden changes in transaction frequency or amounts.
+- Money Laundering: Series of transactions designed to obscure the source of funds.
+- Account Takeover: Unexpected changes in account behavior or access from new locations.
+- First Party Fraud: Customers making purchases or taking out loans with no intention to pay.
+- Structuring: Multiple transactions just below reporting thresholds.
+- Insider Threats: Unusual employee account activities or access patterns.
+
+Your tasks should address these challenges using tools like statistical analysis, machine learning for anomaly detection, pattern recognition, and leveraging historical transaction data.
+Your tasks should also be tasks that an AI can run on the transaction data.
+
+Provide your response in the following format:
+INSIGHTS:
+[List high-level insights here]
+
+CHECKLIST:
+[List detailed, actionable checklist items here. Ensure all tasks are actionable and avoid empty items. Use bullet points for tasks.]
+"""
+
     messages = [
         {"role": "system", "content": "You are a helpful assistant specialized in fraud analysis."},
         {"role": "user", "content": prompt}
     ]
+
+    # Print raw prompt to terminal
     print("\n--- RAW PROMPT ---")
     print(json.dumps(messages, indent=2))
     print("--- END RAW PROMPT ---\n")
+
     response = client.chat.completions.create(model="gpt-4o",
-                                              messages=messages)
+    messages=messages)
+
     # Print raw response to terminal
     print("\n--- RAW RESPONSE ---")
     print(json.dumps(response.model_dump(), indent=2))
     print("--- END RAW RESPONSE ---\n")
+
     return response.choices[0].message.content
 
-
-# Function to parse checklist items
 def parse_checklist(checklist_text):
     lines = checklist_text.split('\n')
     parsed_items = []
@@ -133,8 +174,7 @@ def parse_checklist(checklist_text):
     for line in lines:
         line = line.strip()
         if line and not line.startswith(('CHECKLIST:', 'Checklist:')):
-            if re.match(r'^\d+\.', line) or (
-                    not line.startswith('-') and not line.startswith('•') and ':' in line):  # Main category
+            if re.match(r'^\d+\.', line) or (not line.startswith('-') and not line.startswith('•') and ':' in line):  # Main category
                 current_category = re.sub(r'^\d+\.\s*', '', line)
                 current_subcategory = None
                 parsed_items.append({"text": current_category, "is_category": True, "level": 1})
@@ -154,7 +194,6 @@ def parse_checklist(checklist_text):
                     })
     return parsed_items
 
-
 # Initialize session state
 if 'checklist_items' not in st.session_state:
     st.session_state.checklist_items = []
@@ -168,14 +207,37 @@ st.sidebar.title("Configuration")
 api_key = st.sidebar.text_input("Enter OpenAI API Key", type="password")
 client = OpenAI(api_key=api_key)
 
-# Default automation goals
-default_goals = """I have a suspicious counterfeit check that I want to analyze, using the following automation goals:
--process the check image for anomalies.
--monitor RDI ratios.
--use consortium data."""
-goals = st.sidebar.text_area("Enter Automation Goals", value=default_goals)
+# Analysis type selection
+if 'current_analysis_type' not in st.session_state:
+    st.session_state.current_analysis_type = "Image Analysis"
 
-uploaded_file = st.sidebar.file_uploader("Upload Image", type=["png", "jpg", "jpeg"])
+analysis_type = st.sidebar.radio("Select Analysis Type", ["Image Analysis", "Transaction Analysis"])
+
+if analysis_type != st.session_state.current_analysis_type:
+    clear_analysis_results()
+    st.session_state.current_analysis_type = analysis_type
+
+if analysis_type == "Image Analysis":
+    uploaded_file = st.sidebar.file_uploader("Upload Check Image", type=["png", "jpg", "jpeg"])
+else:
+    if TRANSACTION_DATA:
+        selected_file = st.sidebar.selectbox("Select Transaction File", list(TRANSACTION_DATA.keys()))
+    else:
+        st.sidebar.warning("No transaction data files found in the 'transactions' folder.")
+
+# Default automation goals
+if analysis_type == "Image Analysis":
+    default_goals = """I have a suspicious counterfeit check that I want to analyze, using the following automation goals:
+    -process the check image for anomalies.
+    -monitor RDI ratios.
+    -use consortium data."""
+else:
+    default_goals = """Analyze the transaction data for potential fraud, considering the following goals:
+    -identify unusual transaction patterns.
+    -detect potential money laundering activities.
+    -flag high-risk transactions based on amount and frequency."""
+
+goals = st.sidebar.text_area("Enter Automation Goals", value=default_goals)
 
 # Display knowledge base status
 st.sidebar.subheader("Knowledge Base Status")
@@ -190,35 +252,54 @@ st.title("giniX Fraud Analysis Demo")
 if st.sidebar.button("Generate Analysis"):
     if api_key and goals:
         with st.spinner("Analyzing..."):
-            response = get_llm_response(api_key, goals)
+            if analysis_type == "Image Analysis":
+                if uploaded_file is not None:
+                    response = get_llm_response(api_key, goals, analysis_type)
+                else:
+                    st.warning("Please upload an image for analysis.")
+                    st.stop()
+            else:
+                if TRANSACTION_DATA and selected_file:
+                    transaction_data = TRANSACTION_DATA[selected_file]
+                    response = get_llm_response(api_key, goals, analysis_type, transaction_data=transaction_data)
+                else:
+                    st.warning("No transaction data available for analysis.")
+                    st.stop()
 
             # Split response into insights and checklist
             try:
                 insights, checklist = response.split("CHECKLIST:")
                 insights = insights.replace("INSIGHTS:", "").strip()
                 checklist = checklist.strip()
+
+                # Store AI findings in session state
+                st.session_state.ai_findings = insights
+
+                # Parse and store checklist
+                parsed_items = parse_checklist(checklist)
+                if parsed_items:
+                    st.session_state.checklist_items = parsed_items
+                else:
+                    st.warning("No checklist items were parsed. Check the raw response for formatting issues.")
+
             except ValueError:
                 st.error("Unable to split response into insights and checklist. Check the raw response above.")
-                insights = response
-                checklist = ""
-
-            # Display insights
-            st.subheader("AI Findings")
-            st.write(insights)
-
-            # Parse and display checklist
-            st.subheader("Checklist")
-            parsed_items = parse_checklist(checklist)
-            if parsed_items:
-                st.session_state.checklist_items = parsed_items
-            else:
-                st.warning("No checklist items were parsed. Check the raw response for formatting issues.")
+                st.session_state.ai_findings = response
+                st.session_state.checklist_items = []
 
     else:
         st.warning("Please enter both API key and automation goals.")
 
+# Display AI Findings
+if 'ai_findings' in st.session_state and st.session_state.ai_findings:
+    st.subheader("AI Findings")
+    st.write(st.session_state.ai_findings)
+else:
+    st.info("No AI findings available. Generate an analysis to see insights.")
+
 # Display checklist
 if st.session_state.checklist_items:
+    st.subheader("Checklist")
     current_category = None
     current_subcategory = None
     for i, item in enumerate(st.session_state.checklist_items):
@@ -251,24 +332,29 @@ if st.session_state.checklist_items:
                     context = f"{current_category}"
                     if current_subcategory:
                         context += f" - {current_subcategory}"
-                    response = get_llm_response(api_key, goals, f"{context}: {item['text']}")
+                    response = get_llm_response(api_key, goals, analysis_type, f"{context}: {item['text']}")
                 st.session_state.ai_responses[i] = response
                 st.experimental_rerun()
 
         if i in st.session_state.ai_responses:
             with st.expander(f"AI Response for: {item['text']}"):
-                st.markdown(
-                    f"<div style='background-color: #ffffd0; padding: 10px; border-radius: 5px;'>{st.session_state.ai_responses[i]}</div>",
-                    unsafe_allow_html=True)
+                st.markdown(f"<div style='background-color: #ffffd0; padding: 10px; border-radius: 5px;'>{st.session_state.ai_responses[i]}</div>", unsafe_allow_html=True)
 else:
-    st.warning("No checklist items available. Try generating the analysis again.")
+    st.info("No checklist items available. Generate an analysis to create a checklist.")
 
-# Display uploaded image
-if uploaded_file is not None:
-    st.subheader("Uploaded Check Image")
-    st.image(uploaded_file, caption="Uploaded Check", use_column_width=True)
+# Display uploaded image or transaction data summary
+if analysis_type == "Image Analysis":
+    if uploaded_file is not None:
+        st.subheader("Uploaded Check Image")
+        st.image(uploaded_file, caption="Uploaded Check", use_column_width=True)
+    else:
+        st.info("No check image uploaded. You can upload an image for analysis in the sidebar.")
 else:
-    st.info("No check image uploaded. You can upload an image for analysis in the sidebar.")
+    if TRANSACTION_DATA and selected_file:
+        st.subheader("Transaction Data Summary")
+        st.write(TRANSACTION_DATA[selected_file].describe())
+    else:
+        st.info("No transaction data available. Please add CSV files to the 'transactions' folder.")
 
 # Action buttons
 st.subheader("Actions")
