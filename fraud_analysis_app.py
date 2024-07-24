@@ -1,10 +1,10 @@
 import streamlit as st
-import openai
+from openai import OpenAI
+
 import re
 
 # Function to get LLM response
 def get_llm_response(api_key, goals, task=None):
-    openai.api_key = api_key
     if task:
         prompt = f"Perform the following task related to fraud analysis: {task}\n\nProvide a response indicating if the task was completed, and any follow-up tasks if they exist."
     else:
@@ -41,12 +41,10 @@ CHECKLIST:
         {"role": "user", "content": prompt}
     ]
 
-    response = openai.ChatCompletion.create(
-        model="gpt-4o",
-        messages=messages
-    )
+    response = client.chat.completions.create(model="gpt-4o",
+    messages=messages)
 
-    return response.choices[0].message['content']
+    return response.choices[0].message.content
 
 # Function to parse checklist items
 def parse_checklist(checklist_text):
@@ -91,6 +89,7 @@ st.sidebar.title("Configuration")
 
 # API key input
 api_key = st.sidebar.text_input("Enter OpenAI API Key", type="password")
+client = OpenAI(api_key=api_key)
 
 # Default automation goals
 default_goals = """I have a suspicious counterfeit check that I want to analyze, using the following automation goals:
